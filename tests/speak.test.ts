@@ -364,7 +364,7 @@ describe('spoken replies', () => {
     expect((await $.command.run(cmd('speak'))).text).toBe('Spoken replies are on in every session. Lanes take turns; each lane says its name first.')
     const off = await $.command.run(cmd('speak', 'off'))
     expect(off.text).toBe('Spoken replies are off in every session.')
-    expect(w.writes).toContainEqual({ path: `${DATA}/setting.json`, text: '{"isOn":false,"mode":"queue","announce":true}\n' })
+    expect(w.writes).toContainEqual({ path: `${DATA}/setting.json`, text: '{"isOn":false,"mode":"queue","announce":true,"when":"all","dailyLimit":0}\n' })
     expect(w.runs).toContainEqual(['/usr/bin/pkill', '-KILL', '-f', ANY_SPEECH])
     expect((await $.command.run(cmd('speak'))).text).toBe('Spoken replies are off in every session. Lanes take turns; each lane says its name first.')
     await $.turn.complete(answerTurn('Done.'))
@@ -514,5 +514,85 @@ describe('taking turns', () => {
     await w.started
     expect(body(w).text).toBe('Done.')
     w.endStream()
+  })
+})
+
+describe('more control', () => {
+  const hasStreamed = (w: World) => w.runs.some(run => run.includes('https://api.fish.audio/v1/tts'))
+
+  test('in needed mode a plain report stays quiet and a question is spoken', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}`, setting: '{"when":"needed"}' })
+    await person($)
+    await $.turn.complete(answerTurn('Done. The tests pass.'))
+    await w.clock.advance(1_000)
+    expect(hasStreamed(w)).toBe(false)
+    await $.turn.complete(answerTurn('Done. Should I push it?'))
+    await w.started
+    w.endStream()
+  })
+
+  test('a muted lane stays quiet, and /speak again still replays', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}` })
+    on('session.id', () => ({ value: 'lane-1' }))
+    on('session.cwd', () => ({ value: '/Users/me/code/billing-api' }))
+    await person($)
+    await $.turn.complete(answerTurn('First line.'))
+    await w.started
+    w.endStream()
+    await w.clock.advance(1_000)
+    const before = w.runs.filter(run => run.includes('https://api.fish.audio/v1/tts')).length
+    expect((await $.command.run(cmd('speak', 'mute'))).text).toBe('This lane is muted. /speak again still replays.')
+    await $.turn.complete(answerTurn('Second line.'))
+    await w.clock.advance(1_000)
+    expect(w.runs.filter(run => run.includes('https://api.fish.audio/v1/tts')).length).toBe(before)
+    expect((await $.command.run(cmd('speak', 'again'))).text).toBe("Replaying this lane's last line.")
+    await w.clock.advance(1_000)
+    expect(w.runs.filter(run => run.includes('https://api.fish.audio/v1/tts')).length).toBe(before + 1)
+  })
+
+  test('a lane speed reaches Fish', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}` })
+    on('session.id', () => ({ value: 'lane-1' }))
+    on('session.cwd', () => ({ value: '/Users/me/code/billing-api' }))
+    await person($)
+    expect((await $.command.run(cmd('speak', 'speed 1.4'))).text).toBe('This lane now speaks at 1.4x.')
+    await $.turn.complete(answerTurn('Done.'))
+    await w.started
+    expect(body(w).prosody.speed).toBe(1.4)
+    w.endStream()
+  })
+
+  test('past the daily limit the lane stays quiet and says why once', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}`, setting: '{"dailyLimit":3}' })
+    await person($)
+    await $.turn.complete(answerTurn('Done and dusted.'))
+    await w.clock.advance(1_000)
+    expect(hasStreamed(w)).toBe(false)
+    expect(w.toasts.some(t => t.includes("today's Fish limit"))).toBe(true)
+  })
+
+  test('/speak usage counts what was sent', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}` })
+    await person($)
+    await $.turn.complete(answerTurn('Done.'))
+    await w.started
+    w.endStream()
+    await w.clock.advance(1_000)
+    expect((await $.command.run(cmd('speak', 'usage'))).text).toContain('Today: 1 clips, 5 characters sent to Fish')
+  })
+
+  test('a lane waiting for approval says so, once', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}` })
+    on('session.cwd', () => ({ value: '/Users/me/code/billing-api' }))
+    on('classic.Notification', () => ({}))
+    await person($)
+    await $.classic.Notification({ message: 'Claude needs your permission to use Bash', notification_type: 'permission_prompt' })
+    await w.started
+    expect(body(w).text).toBe('billing api needs your approval.')
+    w.endStream()
+    await w.clock.advance(1_000)
+    await $.classic.Notification({ message: 'again', notification_type: 'permission_prompt' })
+    await w.clock.advance(1_000)
+    expect(w.runs.filter(run => run.includes('https://api.fish.audio/v1/tts')).length).toBe(1)
   })
 })

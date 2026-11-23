@@ -5,6 +5,8 @@ import type { Speaking } from '../types'
 
 /** Who is talking in this lane right now; null when quiet. Drives the glow and the label. */
 const speaking = atom({ plugin: 'claudespeak', key: 'speaking' } as const, null as Speaking | null)
+/** This lane's last spoken line (without its name), for /speak again. */
+const lastLine = atom({ plugin: 'claudespeak', key: 'lastLine' } as const, null as string | null)
 const GLOW_SCENE = 'glow'
 
 /** A steady color per voice, so each lane glows its own hue. */
@@ -59,6 +61,10 @@ const SETTING_FILE = 'setting.json'
 const CURRENT_FILE = 'current-speech'
 /** Per-lane voices: { names, folders, sessions }. Read at every reply, so edits apply at once. */
 const VOICES_FILE = 'voices.json'
+/** Today's characters and clips sent to Fish, for /speak usage and the daily limit. */
+const USAGE_FILE = 'usage.json'
+/** Alerts in one lane closer together than this are said once. */
+const ALERT_GAP_MS = 20_000
 /** One file per clip waiting or playing, named by when it joined. */
 const QUEUE_DIR = 'queue'
 /** How often a waiting lane checks the line. */
@@ -185,15 +191,61 @@ const fishDetail = (body: string): string => {
 }
 
 /** The TTS request. */
-export const ttsBody = (text: string, voiceId: string): string =>
+export const ttsBody = (text: string, voiceId: string, speed: number = SPEECH_SPEED): string =>
   JSON.stringify({
     text,
     reference_id: voiceId,
     format: 'pcm',
     sample_rate: SAMPLE_RATE,
     latency: TTS_LATENCY,
-    prosody: { speed: SPEECH_SPEED },
+    prosody: { speed },
   })
+
+/** A speed as typed or stored: a number from 0.5 to 2.0, else nothing. */
+export const parseSpeed = (text: string | undefined): number | undefined => {
+  const value = Number(text)
+  return text !== undefined && text.trim() !== '' && Number.isFinite(value) && value >= 0.5 && value <= 2 ? value : undefined
+}
+
+const NEEDS_YOU =
+  /\b(let me know|should i|shall i|do you want|would you like|want me to|which (one|option|approach|do you)|your (call|decision|go-ahead|approval|input)|please (confirm|approve|choose|pick|decide)|waiting (on|for) you|needs? your)\b/i
+
+/**
+ * Whether a finished reply leaves something for the person: it ends on a question,
+ * or its last lines ask for a decision. Code blocks are ignored.
+ */
+export const needsYou = (answer: string): boolean => {
+  const prose = answer.replace(/```[\s\S]*?```/g, ' ').trim()
+  const tail = prose.slice(-400)
+  const lastLines = tail.split('\n').filter(line => line.trim() !== '').slice(-3).join(' ')
+  return lastLines.includes('?') || NEEDS_YOU.test(tail)
+}
+
+// ---------- the daily Fish credit guard ----------
+
+export type Usage = { day: string; chars: number; clips: number }
+
+/** The local calendar day of a time, as YYYY-MM-DD. */
+export const localDay = (ms: number): string => {
+  const d = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+/** usage.json for `day`: a new day, or a missing or broken file, starts at zero. */
+export const parseUsage = (text: string | undefined, day: string): Usage => {
+  try {
+    const raw = JSON.parse(text ?? '{}') as { day?: unknown; chars?: unknown; clips?: unknown }
+    if (raw.day !== day) return { day, chars: 0, clips: 0 }
+    return { day, chars: Number(raw.chars) || 0, clips: Number(raw.clips) || 0 }
+  } catch {
+    return { day, chars: 0, clips: 0 }
+  }
+}
+
+/** Whether `adding` more characters fits today's limit: ok, near (past 80%), or over. 0 is no limit. */
+export const limitState = (used: number, adding: number, limit: number): 'ok' | 'near' | 'over' =>
+  limit <= 0 ? 'ok' : used + adding > limit ? 'over' : used + adding > limit * 0.8 ? 'near' : 'ok'
 
 // ---------- per-lane voices ----------
 
@@ -208,9 +260,25 @@ export type VoiceMap = {
   sessionLabels: Record<string, string>
   /** Project folder -> the spoken name of every lane in it. Set with /speak name folder <label>. */
   folderLabels: Record<string, string>
+  /** Session id / folder -> "on" while that lane (or folder) is muted. Set with /speak mute. */
+  sessionMutes: Record<string, string>
+  folderMutes: Record<string, string>
+  /** Session id / folder -> speech speed, 0.5 to 2.0. Set with /speak speed. */
+  sessionSpeeds: Record<string, string>
+  folderSpeeds: Record<string, string>
 }
 
-const EMPTY_VOICES: VoiceMap = { names: {}, folders: {}, sessions: {}, sessionLabels: {}, folderLabels: {} }
+const EMPTY_VOICES: VoiceMap = {
+  names: {},
+  folders: {},
+  sessions: {},
+  sessionLabels: {},
+  folderLabels: {},
+  sessionMutes: {},
+  folderMutes: {},
+  sessionSpeeds: {},
+  folderSpeeds: {},
+}
 
 /** This session's entry, else the deepest folder entry that holds `cwd`. */
 export const pickFor = (
@@ -250,15 +318,26 @@ export const withLaneName = (label: string, line: string): string =>
 // ---------- the queue: one voice at a time, each lane waiting its turn ----------
 
 export type SpeakMode = 'queue' | 'interrupt'
-export type Settings = { isOn: boolean; mode: SpeakMode; announce: boolean }
+/** `all`: every finished reply. `needed`: only replies that ask you something, plus alerts. */
+export type SpeakWhen = 'all' | 'needed'
+export type Settings = { isOn: boolean; mode: SpeakMode; announce: boolean; when: SpeakWhen; dailyLimit: number }
 
-/** setting.json, forgiving: missing fields take the defaults (on, queue, say the lane's name). */
+export const DEFAULT_SETTINGS: Settings = { isOn: true, mode: 'queue', announce: true, when: 'all', dailyLimit: 0 }
+
+/** setting.json, forgiving: missing or odd fields take the defaults. */
 export const parseSettings = (text: string | undefined): Settings => {
   try {
-    const raw = JSON.parse(text ?? '{}') as { isOn?: unknown; mode?: unknown; announce?: unknown }
-    return { isOn: raw.isOn !== false, mode: raw.mode === 'interrupt' ? 'interrupt' : 'queue', announce: raw.announce !== false }
+    const raw = JSON.parse(text ?? '{}') as Record<string, unknown>
+    const limit = Number(raw.dailyLimit)
+    return {
+      isOn: raw.isOn !== false,
+      mode: raw.mode === 'interrupt' ? 'interrupt' : 'queue',
+      announce: raw.announce !== false,
+      when: raw.when === 'needed' ? 'needed' : 'all',
+      dailyLimit: Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 0,
+    }
   } catch {
-    return { isOn: true, mode: 'queue', announce: true }
+    return { ...DEFAULT_SETTINGS }
   }
 }
 
@@ -302,6 +381,10 @@ export const parseVoices = (text: string | undefined): VoiceMap => {
       sessions: stringRecord(raw.sessions),
       sessionLabels: stringRecord(raw.sessionLabels),
       folderLabels: stringRecord(raw.folderLabels),
+      sessionMutes: stringRecord(raw.sessionMutes),
+      folderMutes: stringRecord(raw.folderMutes),
+      sessionSpeeds: stringRecord(raw.sessionSpeeds),
+      folderSpeeds: stringRecord(raw.folderSpeeds),
     }
   } catch {
     return EMPTY_VOICES
@@ -342,11 +425,17 @@ const st: {
   streamTag: string | undefined
   hasWarnedKey: boolean
   isInteractive: boolean
+  lastAlertAt: number
+  warnedNearDay: string
+  warnedOverDay: string
 } = {
   speechGen: 0,
   streamTag: undefined,
   hasWarnedKey: false,
   isInteractive: false,
+  lastAlertAt: Number.NEGATIVE_INFINITY,
+  warnedNearDay: '',
+  warnedOverDay: '',
 }
 
 let cfg: VoiceConfig = DEFAULTS
@@ -479,9 +568,9 @@ async function writeSettings($: $, change: Partial<Settings>): Promise<Settings>
   return next
 }
 
-type Lane = { voiceId: string; voiceName: string; label: string }
+type Lane = { voiceId: string; voiceName: string; label: string; isMuted: boolean; speed: number }
 
-/** This lane's voice, the voice's friendly name, and what the lane is called out loud. */
+/** This lane's voice and its name, what the lane is called out loud, whether it's muted, its speed. */
 async function laneInfo($: $): Promise<Lane> {
   const map = await readVoices($)
   const sessionId = await $.session.id().catch(() => '')
@@ -489,7 +578,46 @@ async function laneInfo($: $): Promise<Lane> {
   const home = (await $.env.get('HOME')) ?? ''
   const voiceId = resolveVoice(map, sessionId, cwd, cfg.voiceId)
   const voiceName = Object.entries(map.names).find(([, v]) => v === voiceId)?.[0] ?? `voice ${voiceId.slice(0, 6)}`
-  return { voiceId, voiceName, label: laneLabel(map, sessionId, cwd, home) }
+  return {
+    voiceId,
+    voiceName,
+    label: laneLabel(map, sessionId, cwd, home),
+    isMuted: pickFor(map.sessionMutes, map.folderMutes, sessionId, cwd) === 'on',
+    speed: parseSpeed(pickFor(map.sessionSpeeds, map.folderSpeeds, sessionId, cwd)) ?? SPEECH_SPEED,
+  }
+}
+
+async function readUsage($: $): Promise<Usage> {
+  const day = localDay(await $.clock.now())
+  return parseUsage(await $.fs.read(await dataPath($, USAGE_FILE)).catch(() => undefined), day)
+}
+
+/** Counts a clip sent to Fish. Lanes share the file; two writing at once may miss one clip. */
+async function addUsage($: $, chars: number): Promise<void> {
+  const used = await readUsage($)
+  await writeData($, USAGE_FILE, `${JSON.stringify({ ...used, chars: used.chars + chars, clips: used.clips + 1 })}\n`)
+}
+
+/** False when this clip would go past today's limit; warns once near it and once over it. */
+async function isWithinLimit($: $, settings: Settings, chars: number): Promise<boolean> {
+  if (settings.dailyLimit <= 0) return true
+  const used = await readUsage($)
+  const state = limitState(used.chars, chars, settings.dailyLimit)
+  if (state === 'over') {
+    if (st.warnedOverDay !== used.day) {
+      st.warnedOverDay = used.day
+      $.ui.toast(
+        `claudespeak: today's Fish limit (${settings.dailyLimit} characters) is reached. Speech is paused until tomorrow, or raise it with /speak limit.`,
+        { timeoutMs: 10000 },
+      )
+    }
+    return false
+  }
+  if (state === 'near' && st.warnedNearDay !== used.day) {
+    st.warnedNearDay = used.day
+    $.ui.toast(`claudespeak: past 80% of today's Fish limit (${used.chars + chars} of ${settings.dailyLimit} characters).`, { timeoutMs: 8000 })
+  }
+  return true
 }
 
 /** Shows this lane's bar: waiting its turn, or speaking. */
@@ -568,7 +696,7 @@ async function waitTurn($: $, ticket: string, gen: number, lane: Lane): Promise<
 async function streamSpeech($: $, key: string, ffmpeg: string, text: string, clip: string, lane: Lane): Promise<void> {
   const tag = `${TAG_PREFIX}${await $.clock.now()}`
   const bodyPath = `${await tmpDir($)}/${tag}.json`
-  await $.fs.write(bodyPath, ttsBody(text, lane.voiceId))
+  await $.fs.write(bodyPath, ttsBody(text, lane.voiceId, lane.speed))
   await $.process.run(['/bin/mkdir', '-p', '-m', '700', await homeData($)])
   st.streamTag = tag
   await glowOn($, clip, lane)
@@ -594,29 +722,42 @@ async function streamSpeech($: $, key: string, ffmpeg: string, text: string, cli
   }
 }
 
-async function speak($: $, answer: string): Promise<void> {
-  stopSpeech($)
-  const gen = st.speechGen
-  const startedAt = await $.clock.now()
+type SayOptions = {
+  /** The lane's speech generation when this clip began; a newer one here drops it. */
+  gen: number
+  /** When this clip began; a /speak stop after it drops it. */
+  startedAt: number
+  lane: Lane
+  /** The words already include who is talking (alerts): don't add the lane's name. */
+  isNamed?: boolean
+  /** Remember these words for /speak again. */
+  remember?: string
+}
+
+/** Says one line in this lane's voice: takes its turn in line, plays, counts it. */
+async function sayLine($: $, line: string, opts: SayOptions): Promise<void> {
   const key = await apiKey($)
   if (key === undefined) return askForKey($)
-  const line = await summarize($, answer)
-  if (line === '' || gen !== st.speechGen) return
   const current = await $.fs.read(await dataPath($, CURRENT_FILE)).catch(() => '')
-  if (current.startsWith('stopped ') && Number(current.slice(8)) > startedAt) return
+  if (current.startsWith('stopped ') && Number(current.slice(8)) > opts.startedAt) return
   const ffmpeg = await findFfmpeg($)
   if (ffmpeg === undefined) {
     $.ui.toast('ffmpeg not found: brew install ffmpeg', { timeoutMs: 8000 })
     return
   }
   const settings = await readSettings($)
-  const lane = await laneInfo($)
-  const text = settings.announce ? withLaneName(lane.label, line) : line
+  const text = settings.announce && !opts.isNamed ? withLaneName(opts.lane.label, line) : line
+  if (opts.remember !== undefined) await update($, lastLine, () => opts.remember ?? null)
+  if (!(await isWithinLimit($, settings, text.length))) return
   const clip = ticketName(await $.clock.now(), Math.random() * 1_000_000)
-  if (settings.mode === 'interrupt') return streamSpeech($, key, ffmpeg, text, clip, lane)
+  if (settings.mode === 'interrupt') {
+    await addUsage($, text.length)
+    return streamSpeech($, key, ffmpeg, text, clip, opts.lane)
+  }
   try {
-    if (!(await waitTurn($, clip, gen, lane))) return
-    await streamSpeech($, key, ffmpeg, text, clip, lane)
+    if (!(await waitTurn($, clip, opts.gen, opts.lane))) return
+    await addUsage($, text.length)
+    await streamSpeech($, key, ffmpeg, text, clip, opts.lane)
     // Hold the place a moment so the next lane starts after a short pause, not on top.
     await touchTicket($, clip)
     await $.clock.sleep(GAP_MS)
@@ -624,6 +765,38 @@ async function speak($: $, answer: string): Promise<void> {
     await glowOff($, clip)
     await dropTicket($, clip)
   }
+}
+
+/** A finished reply: summarised, then said, unless this lane is muted or only speaks when needed. */
+async function speak($: $, answer: string): Promise<void> {
+  stopSpeech($)
+  const gen = st.speechGen
+  const startedAt = await $.clock.now()
+  const settings = await readSettings($)
+  if (settings.when === 'needed' && !needsYou(answer)) return
+  const lane = await laneInfo($)
+  if (lane.isMuted) return
+  if ((await apiKey($)) === undefined) return askForKey($)
+  const line = await summarize($, answer)
+  if (line === '' || gen !== st.speechGen) return
+  await sayLine($, line, { gen, startedAt, lane, remember: line })
+}
+
+export type AlertKind = 'approval' | 'question'
+
+/** What a lane says when it stops to ask you something mid-turn. */
+export const alertLine = (label: string, kind: AlertKind): string =>
+  `${label === '' ? 'A lane' : label} ${kind === 'approval' ? 'needs your approval.' : 'has a question for you.'}`
+
+/** A lane waiting on you mid-turn: says so once, in line like any clip. */
+async function alert($: $, kind: AlertKind): Promise<void> {
+  const now = await $.clock.now()
+  if (now - st.lastAlertAt < ALERT_GAP_MS) return
+  st.lastAlertAt = now
+  if (!(await mayTalkHere($)) || !(await isSettingOn($))) return
+  const lane = await laneInfo($)
+  if (lane.isMuted) return
+  await sayLine($, alertLine(lane.label, kind), { gen: st.speechGen, startedAt: now, lane, isNamed: true })
 }
 
 /**
@@ -636,6 +809,21 @@ async function mayTalkHere($: $): Promise<boolean> {
   if ((await $.env.get('CLAUDE_CODE_ENTRYPOINT')) === 'local-agent') return false
   if (st.isInteractive) return true
   return ((await $.session.surfaces().catch(() => [])) ?? []).length > 0
+}
+
+type LaneSlots = 'Mutes' | 'Speeds' | 'Labels'
+
+/** Sets or clears this lane's (or its folder's) entry in voices.json. Returns the folder. */
+async function setLaneEntry($: $, slots: LaneSlots, isFolder: boolean, value: string | undefined): Promise<string> {
+  const map = await readVoices($)
+  const sessionId = await $.session.id()
+  const cwd = await $.session.cwd()
+  const target = isFolder ? map[`folder${slots}`] : map[`session${slots}`]
+  const slot = isFolder ? cwd : sessionId
+  if (value === undefined) delete target[slot]
+  else target[slot] = value
+  await writeData($, VOICES_FILE, `${JSON.stringify(map, null, 2)}\n`)
+  return cwd
 }
 
 export const register: Register = (on, options) => {
@@ -687,8 +875,8 @@ export const register: Register = (on, options) => {
     }
     await $.command.register({
       name: 'speak',
-      description: 'Read replies aloud: /speak on|off|stop|key|voices, voice|name [folder] <…|default>, mode queue|interrupt, announce on|off',
-      argumentHint: '[on|off|stop|key|voices|voice …|name …|mode queue|interrupt|announce on|off]',
+      description: 'Read replies aloud: /speak on|off|stop|again|key|voices|usage, voice|name|speed [folder] …, mute|unmute [folder], mode, announce, when, limit',
+      argumentHint: '[on|off|stop|again|voice …|name …|speed …|mute|unmute|when all|needed|mode queue|interrupt|announce on|off|usage|limit <n>|off]',
       immediate: true,
     })
     return next(e)
@@ -785,12 +973,66 @@ export const register: Register = (on, options) => {
             : `${where} is now called "${pick}" out loud.`,
       }
     }
+    if (arg === 'again') {
+      const line = await read($, lastLine)
+      if (line === null) return { text: 'Nothing to replay yet in this lane.' }
+      const lane = await laneInfo($)
+      void sayLine($, line, { gen: st.speechGen, startedAt: await $.clock.now(), lane }).catch(() => undefined)
+      return { text: 'Replaying this lane\'s last line.' }
+    }
+    const muteArgs = /^(mute|unmute)(\s+folder)?$/.exec(arg)
+    if (muteArgs) {
+      const isMute = muteArgs[1] === 'mute'
+      const isFolder = muteArgs[2] !== undefined
+      const cwd = await setLaneEntry($, 'Mutes', isFolder, isMute ? 'on' : undefined)
+      if (isMute) stopSpeech($)
+      const where = isFolder ? `Every lane in ${cwd} is` : 'This lane is'
+      return { text: `${where} ${isMute ? 'muted' : 'unmuted'}.${isMute ? ' /speak again still replays.' : ''}` }
+    }
+    const speedArgs = /^speed(\s+folder)?(?:\s+(\S+))?$/.exec(arg)
+    if (speedArgs) {
+      const isFolder = speedArgs[1] !== undefined
+      const pick = speedArgs[2]
+      if (pick === undefined) return { text: `This lane speaks at ${(await laneInfo($)).speed}x.` }
+      if (pick === 'default') {
+        const cwd = await setLaneEntry($, 'Speeds', isFolder, undefined)
+        return { text: `${isFolder ? `Every lane in ${cwd}` : 'This lane'} goes back to ${SPEECH_SPEED}x.` }
+      }
+      const speed = parseSpeed(pick)
+      if (speed === undefined) return { text: 'Speed is a number from 0.5 to 2.0, such as /speak speed 1.3.' }
+      const cwd = await setLaneEntry($, 'Speeds', isFolder, String(speed))
+      return { text: `${isFolder ? `Every lane in ${cwd}` : 'This lane'} now speaks at ${speed}x.` }
+    }
+    if (arg === 'when all' || arg === 'when needed') {
+      const when = arg === 'when all' ? 'all' : 'needed'
+      await writeSettings($, { when })
+      return {
+        text:
+          when === 'all'
+            ? 'Every finished reply is spoken again.'
+            : 'Lanes now speak only when they need you: a reply that asks you something, an approval or a question.',
+      }
+    }
+    if (arg === 'usage') {
+      const used = await readUsage($)
+      const { dailyLimit } = await readSettings($)
+      const cap = dailyLimit > 0 ? ` of your ${dailyLimit} limit` : ' (no daily limit; set one with /speak limit 20000)'
+      return { text: `Today: ${used.clips} clips, ${used.chars} characters sent to Fish${cap}.` }
+    }
+    const limitArgs = /^limit\s+(off|\d+)$/.exec(arg)
+    if (limitArgs) {
+      const dailyLimit = limitArgs[1] === 'off' ? 0 : Number(limitArgs[1])
+      await writeSettings($, { dailyLimit })
+      return { text: dailyLimit > 0 ? `Speech pauses for the day after ${dailyLimit} characters sent to Fish.` : 'No daily limit.' }
+    }
     const settings = await readSettings($)
     const quiet = settings.isOn && !(await mayTalkHere($)) ? ' This session stays quiet: no person is attached to it.' : ''
     const noKey = (await apiKey($)) === undefined ? ' No Fish Audio key yet: run /speak key.' : ''
     const how = settings.mode === 'queue' ? 'Lanes take turns' : 'The newest reply cuts in'
     const names = settings.announce ? 'each lane says its name first' : 'lane names are off'
-    return { text: `Spoken replies are ${settings.isOn ? 'on' : 'off'} in every session. ${how}; ${names}.${quiet}${noKey}` }
+    const when = settings.when === 'needed' ? ' Only replies that need you are spoken.' : ''
+    const muted = (await laneInfo($)).isMuted ? ' This lane is muted.' : ''
+    return { text: `Spoken replies are ${settings.isOn ? 'on' : 'off'} in every session. ${how}; ${names}.${when}${muted}${quiet}${noKey}` }
   }).catch(() => ({ text: 'claudespeak: /speak failed.' }))
 
   // A new prompt means the person has moved on: cut the old reply's speech.
@@ -809,6 +1051,23 @@ export const register: Register = (on, options) => {
     })
     return result
   })
+
+  // A lane that stops mid-turn to ask you something says so, in line like any clip.
+  on('classic.Notification', ($, e, next) => {
+    const kind = e.notification_type === 'permission_prompt' ? 'approval' : e.notification_type === 'elicitation_dialog' ? 'question' : undefined
+    if (kind !== undefined) void alert($, kind).catch(() => undefined)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('classic.PermissionRequest', ($, e, next) => {
+    void alert($, 'approval').catch(() => undefined)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    if (e.agentId === undefined) void alert($, 'question').catch(() => undefined)
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('session.end', ($, e, next) => {
     stopSpeech($)

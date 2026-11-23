@@ -13,6 +13,6 @@ export type Speaking = {
 
 declare module 'claude-code' {
   interface PluginState {
-    claudespeak: { speaking: Speaking | null }
+    claudespeak: { speaking: Speaking | null; lastLine: string | null }
   }
 }

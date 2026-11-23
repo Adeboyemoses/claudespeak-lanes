@@ -7,9 +7,12 @@ When a Claude Code reply finishes, claudespeak-lanes reads a one-to-three senten
 - **Every lane can have its own voice**, so you can tell by ear which session just finished.
 - **Lanes take turns.** When several lanes finish at once, each waits for the one before it to finish its sentence. Nobody gets cut off.
 - **Each lane says its name first,** for example *"billing api. The tests pass now."*, so you know who's talking without looking.
+- **Speak only when it matters,** if you like: just the replies that ask you something, plus a spoken alert when a lane stops to ask for your approval or a choice.
+- **Per-lane control:** mute a noisy lane, give each lane its own speed, and replay what a lane last said.
+- **A daily credit guard** that counts what you send to Fish and can pause speech at a limit you set.
 - **The lane that's talking shows a bar** in its own color above the message box, with its name, its voice and a **Stop** button. Lanes waiting their turn show how many are ahead of them.
 
-This is a modified version of [albertshiney/claudespeak](https://github.com/albertshiney/claudespeak). The original reads replies aloud. This version adds per-lane voices, taking turns, spoken lane names and the speaking bar. See [Credits](#credits).
+This is a modified version of [albertshiney/claudespeak](https://github.com/albertshiney/claudespeak). The original reads replies aloud. This version adds per-lane voices, taking turns, spoken lane names, alerts, mute, speed, replay, a credit guard and the speaking bar. See [Credits](#credits).
 
 ---
 
@@ -22,6 +25,9 @@ This is a modified version of [albertshiney/claudespeak](https://github.com/albe
 - [Give each lane its own voice](#give-each-lane-its-own-voice)
 - [Lanes take turns](#lanes-take-turns)
 - [Lane names](#lane-names)
+- [Only when it needs you](#only-when-it-needs-you)
+- [Mute, speed and replay](#mute-speed-and-replay)
+- [Daily credit guard](#daily-credit-guard)
 - [The speaking bar](#the-speaking-bar)
 - [Commands](#commands)
 - [Settings](#settings)
@@ -173,6 +179,59 @@ Lanes in your home folder or the app's temporary scratch folders have no name un
 
 To stop saying names: `/speak announce off` (and `/speak announce on` to bring them back).
 
+## Only when it needs you
+
+By default every finished reply is spoken. To hear only what needs you, run:
+
+```text
+/speak when needed
+```
+
+Then a lane speaks only when:
+
+- **its reply ends by asking you something,** such as a question in its last lines, or "let me know", "should I…", "which one…" or "please confirm";
+- **it stops mid-turn for your approval** (a permission prompt): *"billing api needs your approval."*;
+- **it stops to ask you a question with options:** *"billing api has a question for you."*
+
+`/speak when all` goes back to every reply. The approval and question alerts are spoken in both settings. One lane says each alert at most once every 20 seconds, so a burst of prompts doesn't turn into a burst of speech.
+
+## Mute, speed and replay
+
+| Command | What it does |
+| --- | --- |
+| `/speak mute` | Silences this lane, including its alerts. Other lanes carry on |
+| `/speak mute folder` | Silences every lane in this folder |
+| `/speak unmute` / `/speak unmute folder` | Undoes it |
+| `/speak speed 1.3` | This lane speaks at 1.3x (from 0.5 to 2.0) |
+| `/speak speed folder 0.9` | Every lane in this folder speaks at 0.9x |
+| `/speak speed` | Says this lane's speed |
+| `/speak speed default` | Back to the default (1.1x) |
+| `/speak again` | Replays this lane's last line, even while muted. It waits its turn like any clip |
+
+Mute and speed settings are stored in `voices.json` (`sessionMutes`, `folderMutes`, `sessionSpeeds`, `folderSpeeds`) and follow the same order as voices: the lane's own setting, then the deepest matching folder.
+
+## Daily credit guard
+
+Every clip sent to Fish is counted, per calendar day:
+
+```text
+/speak usage
+```
+
+> Today: 23 clips, 3140 characters sent to Fish (no daily limit; set one with /speak limit 20000).
+
+To cap it:
+
+```text
+/speak limit 20000
+```
+
+- **Near the limit:** past 80%, each lane warns you once that day.
+- **At the limit:** speech pauses until midnight (your local time), and each lane tells you once.
+- **No limit:** `/speak limit off` (the default).
+
+Fish bills by text sent, so characters are a close guide to cost. The count includes each lane's spoken name. If two lanes finish at the same instant the count can miss a clip, so treat it as a guide, not an invoice.
+
 ## The speaking bar
 
 While a lane is talking, a full-width bar shows above its message box:
@@ -211,10 +270,16 @@ A lane waiting its turn shows a quieter line instead:
 | `/speak name folder <name>` | Sets the spoken name for every lane in this folder |
 | `/speak name default` / `/speak name folder default` | Clears it |
 | `/speak announce on` / `off` | Say each lane's name first, or not (on by default) |
+| `/speak again` | Replays this lane's last line |
+| `/speak mute` / `unmute` (`folder`) | Silences or unsilences this lane, or its folder |
+| `/speak speed <0.5–2.0>` / `default` (`folder`) | Sets this lane's (or folder's) speed |
+| `/speak when needed` / `all` | Speak only replies that need you, or every reply |
+| `/speak usage` | Today's clips and characters sent to Fish |
+| `/speak limit <characters>` / `off` | Pauses speech for the day past this many characters |
 | `/speak mode queue` | Lanes take turns (the default) |
 | `/speak mode interrupt` | The newest reply cuts off whatever is playing |
 
-`/speak on|off`, `mode` and `announce` apply to every session on the machine, including ones already open.
+`/speak on|off`, `mode`, `announce`, `when` and `limit` apply to every session on the machine, including ones already open.
 
 ## Settings
 
@@ -235,8 +300,9 @@ Everything lives in `~/.claude/claudespeak/`, outside the plugin folder, so rein
 | File | What it holds |
 | --- | --- |
 | `.env` | Your Fish Audio key (owner-only permissions) |
-| `voices.json` | Voice names, each folder's and session's voice, and lane names |
-| `setting.json` | On or off, `queue` or `interrupt`, and whether lanes say their names |
+| `voices.json` | Voice names, plus each folder's and session's voice, name, mute and speed |
+| `setting.json` | On or off, `queue` or `interrupt`, lane names on or off, `all` or `needed`, and the daily limit |
+| `usage.json` | Today's clips and characters sent to Fish |
 | `current-speech` | Which clip is playing, and when Stop was last pressed |
 | `queue/` | One small file per clip waiting or playing: the line |
 
@@ -247,7 +313,7 @@ Session picks in `voices.json` are keyed by session id. Old ones are harmless, a
 - **Fish Audio:** every spoken reply uses Fish credits. Spoken replies are on by default, in every session a person is attached to.
 - **Claude:** long replies use one small Haiku call on your Claude account to write the summary. Short plain replies use none.
 
-Run `/speak off` to stop both.
+To spend less: `/speak when needed` speaks far fewer replies, `/speak limit` caps the day, and `/speak off` stops both kinds of cost.
 
 ## Troubleshooting
 
@@ -255,6 +321,8 @@ Run `/speak off` to stop both.
 | --- | --- |
 | A lane still cuts another off | Run `/speak` and check it says "Lanes take turns". If not, run `/speak mode queue`. Lanes not yet reloaded still run the old code: `/reload-plugins` |
 | A lane never spoke | It may have waited over 90 seconds and given up. Its bar shows how many lanes are ahead while it waits |
+| A lane went quiet | Run `/speak` in it: it says if the lane is muted or only replies that need you are spoken. `/speak usage` shows if the daily limit was reached |
+| No alert when a lane asked for approval | Alerts come from Claude Code's own notifications. Run `/reload-plugins` in that lane, and check it isn't muted |
 | A lane's spoken name sounds odd | Give it one: `/speak name Billing` |
 | Every reply is spoken twice | The original claudespeak is still on: `claude plugin disable claudespeak@claudespeak`, then `/reload-plugins` in each lane |
 | A lane uses the wrong voice | Run `/speak voice` in it to see which voice it picked and why |
@@ -277,8 +345,8 @@ hooks/
 types/
   index.d.ts         types for the speaking bar's saved state
 tests/
-  speak.test.ts      speaking, keys, settings, who may speak, taking turns
-  lanes.test.ts      per-lane voices, lane names, line order, settings
+  speak.test.ts      speaking, keys, settings, taking turns, mute, replay, alerts, limit
+  lanes.test.ts      voices, names, line order, settings, needs-you, speed, usage
 ```
 
 Check and test it:
@@ -297,6 +365,6 @@ The tests run against a fake engine, with no speaker, network or Fish credits.
 
 Based on [claudespeak](https://github.com/albertshiney/claudespeak) by albertshiney, which reads Claude Code replies aloud with Fish Audio. Speech, summaries, streaming playback and the one-voice-at-a-time design come from that project.
 
-Added here: per-lane voices (`voices.json`, `/speak voice`, `/speak voices`), taking turns (`/speak mode`), spoken lane names (`/speak name`, `/speak announce`), and the speaking bar with its per-voice colors.
+Added here: per-lane voices (`voices.json`, `/speak voice`, `/speak voices`), taking turns (`/speak mode`), spoken lane names (`/speak name`, `/speak announce`), approval and question alerts with `/speak when`, mute, per-lane speed, replay (`/speak again`), the daily credit guard (`/speak usage`, `/speak limit`), and the speaking bar with its per-voice colors.
 
 The original repository has no license, so its author keeps all rights to their code. Please ask before reusing it beyond personal use.

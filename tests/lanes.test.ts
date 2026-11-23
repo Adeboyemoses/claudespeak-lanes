@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { laneLabel, parseSettings, parseVoices, placeInLine, resolveVoice, ticketName, voiceIdOf, withLaneName } from '../hooks/register.tsx'
+import { alertLine, laneLabel, limitState, localDay, needsYou, parseSettings, parseSpeed, parseUsage, parseVoices, placeInLine, resolveVoice, ticketName, voiceIdOf, withLaneName } from '../hooks/register.tsx'
 
 const map = parseVoices(JSON.stringify({
   names: { Sawyer: 'aaa', Narrator: 'bbb' },
@@ -49,9 +49,52 @@ describe('the line', () => {
   test('stray files are ignored', () =>
     expect(placeInLine([{ name: '.DS_Store', mtimeMs: now }, { name: mine, mtimeMs: now }], mine, now, 5_000)).toBe(0))
   test('settings default to on, queue and announce', () => {
-    expect(parseSettings(undefined)).toEqual({ isOn: true, mode: 'queue', announce: true })
-    expect(parseSettings('{"isOn":false}')).toEqual({ isOn: false, mode: 'queue', announce: true })
-    expect(parseSettings('{"mode":"interrupt","announce":false}')).toEqual({ isOn: true, mode: 'interrupt', announce: false })
-    expect(parseSettings('{broken')).toEqual({ isOn: true, mode: 'queue', announce: true })
+    const d = { isOn: true, mode: 'queue', announce: true, when: 'all', dailyLimit: 0 }
+    expect(parseSettings(undefined)).toEqual(d)
+    expect(parseSettings('{"isOn":false}')).toEqual({ ...d, isOn: false })
+    expect(parseSettings('{"mode":"interrupt","announce":false}')).toEqual({ ...d, mode: 'interrupt', announce: false })
+    expect(parseSettings('{"when":"needed","dailyLimit":20000}')).toEqual({ ...d, when: 'needed', dailyLimit: 20000 })
+    expect(parseSettings('{"dailyLimit":-5}')).toEqual(d)
+    expect(parseSettings('{broken')).toEqual(d)
   })
+})
+
+describe('only when needed', () => {
+  test('a reply that ends on a question needs you', () => expect(needsYou('I fixed it.\n\nShould I also update the docs?')).toBe(true))
+  test('a reply asking for a decision needs you', () => expect(needsYou('Two options are ready. Let me know which one to ship.')).toBe(true))
+  test('a plain report does not', () => expect(needsYou('Done. The tests pass and the branch is pushed.')).toBe(false))
+  test('a question mark inside code does not count', () => expect(needsYou('Fixed:\n```ts\nconst a = b ? c : d\n```\nAll green.')).toBe(false))
+  test('alerts name the lane', () => {
+    expect(alertLine('billing api', 'approval')).toBe('billing api needs your approval.')
+    expect(alertLine('', 'question')).toBe('A lane has a question for you.')
+  })
+})
+
+describe('per-lane speed', () => {
+  test('takes 0.5 to 2.0', () => {
+    expect(parseSpeed('1.3')).toBe(1.3)
+    expect(parseSpeed('0.5')).toBe(0.5)
+    expect(parseSpeed('2')).toBe(2)
+  })
+  test('refuses anything else', () => {
+    expect(parseSpeed('3')).toBeUndefined()
+    expect(parseSpeed('fast')).toBeUndefined()
+    expect(parseSpeed('')).toBeUndefined()
+    expect(parseSpeed(undefined)).toBeUndefined()
+  })
+})
+
+describe('the credit guard', () => {
+  test('a new day starts at zero', () => {
+    expect(parseUsage('{"day":"2026-11-22","chars":900,"clips":4}', '2026-11-23')).toEqual({ day: '2026-11-23', chars: 0, clips: 0 })
+    expect(parseUsage('{"day":"2026-11-23","chars":900,"clips":4}', '2026-11-23')).toEqual({ day: '2026-11-23', chars: 900, clips: 4 })
+    expect(parseUsage('{broken', '2026-11-23').chars).toBe(0)
+  })
+  test('ok, near, then over the limit', () => {
+    expect(limitState(100, 50, 1000)).toBe('ok')
+    expect(limitState(790, 50, 1000)).toBe('near')
+    expect(limitState(990, 50, 1000)).toBe('over')
+    expect(limitState(999_999, 50, 0)).toBe('ok')
+  })
+  test('days are local calendar days', () => expect(localDay(new Date(2026, 10, 23, 23, 59).getTime())).toBe('2026-11-23'))
 })
