@@ -1,0 +1,14 @@
+{
+  "name": "claudespeak-lanes",
+  "owner": {
+    "name": "Adeboyemoses"
+  },
+  "description": "claudespeak with per-lane voices and a speaking bar (local copy)",
+  "plugins": [
+    {
+      "name": "claudespeak",
+      "source": "./",
+      "description": "Reads a short summary of each Claude Code reply aloud with Fish Audio"
+    }
+  ]
+}
