@@ -21,7 +21,7 @@ type World = {
   /** Resolves when a clip starts. */
   started: Promise<string>
   /** Lets a streaming run end, as the clip's end or a kill does. */
-  endStream: () => void
+  endStream: (exitCode?: number) => void
   /** The fake clock, to move time on while a lane waits its turn. */
   clock: ReturnType<typeof mock.clock>
   /** Whether another lane's clip is playing, as pgrep would report it. */
@@ -49,9 +49,9 @@ const world = (
   if (opts.setting !== undefined) files.set(`${DATA}/setting.json`, opts.setting)
   if (opts.current !== undefined) files.set(`${DATA}/current-speech`, opts.current)
   let started: (how: string) => void = () => undefined
-  let endStream: () => void = () => undefined
-  const streamEnded = new Promise<void>(resolve => {
-    endStream = resolve
+  let endStream: (exitCode?: number) => void = () => undefined
+  const streamEnded = new Promise<number>(resolve => {
+    endStream = (exitCode = 0) => resolve(exitCode)
   })
   const w: World = {
     runs: [],
@@ -63,7 +63,7 @@ const world = (
     started: new Promise(resolve => {
       started = resolve
     }),
-    endStream: () => endStream(),
+    endStream: (exitCode?: number) => endStream(exitCode),
     clock,
     setPlaying: isPlaying => {
       playing.value = isPlaying
@@ -107,8 +107,8 @@ const world = (
     if (bin === '/bin/sh' && e.argv.includes('https://api.fish.audio/v1/tts')) {
       started('stream')
       if (opts.stderr !== undefined) return { value: ran('', 22, opts.stderr) }
-      await streamEnded
-      return { value: ran('') }
+      const exitCode = await streamEnded
+      return { value: ran('', exitCode) }
     }
     if (bin === '/usr/bin/which') return { value: ran('', 1) }
     if (bin === '/usr/bin/pgrep') return { value: ran('', playing.value ? 0 : 1) }
@@ -594,5 +594,72 @@ describe('more control', () => {
     await $.classic.Notification({ message: 'again', notification_type: 'permission_prompt' })
     await w.clock.advance(1_000)
     expect(w.runs.filter(run => run.includes('https://api.fish.audio/v1/tts')).length).toBe(1)
+  })
+})
+
+describe('a lane that keeps working keeps talking', () => {
+  const ttsRuns = (w: World) => w.runs.filter(run => run.includes('https://api.fish.audio/v1/tts')).length
+  /** pkill aimed at one clip (this lane cutting its own), not the every-lane stop pattern. */
+  const cutOwnClip = (w: World) => w.runs.some(run => run[0] === '/usr/bin/pkill' && run[3] !== ANY_SPEECH)
+
+  test('a new prompt in the lane does not cut its clip', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}` })
+    await person($)
+    await $.turn.complete(answerTurn('First update.'))
+    await w.started
+    await $.prompt.submit({ text: 'carry on', origin: { kind: 'composer' as const } } as never)
+    await w.clock.advance(500)
+    expect(cutOwnClip(w)).toBe(false)
+    w.endStream()
+  })
+
+  test("the lane's next update waits behind the one playing, then plays", async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}` })
+    await person($)
+    await $.turn.complete(answerTurn('First update.'))
+    await w.started
+    w.setPlaying(true)
+    await $.turn.complete(answerTurn('Second update.'))
+    await w.clock.advance(2_000)
+    expect(cutOwnClip(w)).toBe(false)
+    expect(ttsRuns(w)).toBe(1)
+    w.endStream()
+    w.setPlaying(false)
+    await w.clock.advance(2_000)
+    expect(ttsRuns(w)).toBe(2)
+  })
+
+  test('in interrupt mode the next update still cuts the old one', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}`, setting: '{"mode":"interrupt"}' })
+    await person($)
+    await $.turn.complete(answerTurn('First update.'))
+    await w.started
+    await $.turn.complete(answerTurn('Second update.'))
+    await w.clock.advance(500)
+    expect(cutOwnClip(w)).toBe(true)
+    w.endStream(1)
+  })
+
+  test('a clip cut on purpose shows no failure', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}` })
+    on('session.id', () => ({ value: 'lane-1' }))
+    on('session.cwd', () => ({ value: '/Users/me/code/billing-api' }))
+    await person($)
+    await $.turn.complete(answerTurn('Done.'))
+    await w.started
+    await $.command.run(cmd('speak', 'mute'))
+    w.endStream(1)
+    await w.clock.advance(1_000)
+    expect(w.toasts.some(t => t.includes('playback failed'))).toBe(false)
+  })
+
+  test('a real playback failure still says so', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}` })
+    await person($)
+    await $.turn.complete(answerTurn('Done.'))
+    await w.started
+    w.endStream(1)
+    await w.clock.advance(1_000)
+    expect(w.toasts.some(t => t.includes('playback failed'))).toBe(true)
   })
 })

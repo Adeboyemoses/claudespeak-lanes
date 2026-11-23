@@ -153,11 +153,11 @@ By default, lanes form a line. When a reply finishes while another lane is talki
 
 - **Waiting shows in the lane:** a waiting lane's bar reads `⏳ WAITING TO SPEAK · … · 2 ahead`.
 - **Old news is dropped:** a lane that has waited more than 90 seconds gives up rather than reading out something stale.
-- **A new message replaces the old clip:** if you send a lane a new message, its old clip, waiting or playing, is dropped.
+- **A lane keeps talking while it works:** when a lane carries on working (you send it a message, or it continues by itself), the clip it's playing finishes. Its next update joins the line behind it.
 - **Stop clears everything:** **Stop** (or `/speak stop`) cuts the current clip and empties the line.
 - **No stuck locks:** the line is a folder of small files, one per waiting clip, and each waiting lane refreshes its file a few times a second. If a lane crashes or is closed while waiting, its file stops being refreshed, and within about 5 seconds the others stop counting it.
 
-Prefer the original behaviour, where the newest reply cuts in right away? Run:
+Prefer the original behaviour, where the newest reply cuts in right away, and a new message in a lane cuts that lane's clip? Run:
 
 ```text
 /speak mode interrupt
@@ -319,6 +319,7 @@ To spend less: `/speak when needed` speaks far fewer replies, `/speak limit` cap
 
 | What you see | What to do |
 | --- | --- |
+| "claudespeak: playback failed" when a clip was cut | Fixed in 0.3.1: a clip cut on purpose (Stop, mute, interrupt mode) no longer reports a failure. Run `/reload-plugins`. If it still shows, ffmpeg or the audio device really failed, and the message ends with the reason |
 | A lane still cuts another off | Run `/speak` and check it says "Lanes take turns". If not, run `/speak mode queue`. Lanes not yet reloaded still run the old code: `/reload-plugins` |
 | A lane never spoke | It may have waited over 90 seconds and given up. Its bar shows how many lanes are ahead while it waits |
 | A lane went quiet | Run `/speak` in it: it says if the lane is muted or only replies that need you are spoken. `/speak usage` shows if the daily limit was reached |

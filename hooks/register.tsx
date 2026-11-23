@@ -428,6 +428,8 @@ const st: {
   lastAlertAt: number
   warnedNearDay: string
   warnedOverDay: string
+  /** Clips this lane cut on purpose: their end is not a failure. */
+  cutTags: Set<string>
 } = {
   speechGen: 0,
   streamTag: undefined,
@@ -436,6 +438,7 @@ const st: {
   lastAlertAt: Number.NEGATIVE_INFINITY,
   warnedNearDay: '',
   warnedOverDay: '',
+  cutTags: new Set(),
 }
 
 let cfg: VoiceConfig = DEFAULTS
@@ -443,7 +446,10 @@ let cfg: VoiceConfig = DEFAULTS
 function stopSpeech($: $): void {
   st.speechGen += 1
   // KILL, not TERM: on TERM ffmpeg plays out everything it has already queued.
-  if (st.streamTag !== undefined) void $.process.run([PKILL, '-KILL', '-f', st.streamTag]).catch(() => undefined)
+  if (st.streamTag !== undefined) {
+    st.cutTags.add(st.streamTag)
+    void $.process.run([PKILL, '-KILL', '-f', st.streamTag]).catch(() => undefined)
+  }
   st.streamTag = undefined
 }
 
@@ -692,6 +698,18 @@ async function waitTurn($: $, ticket: string, gen: number, lane: Lane): Promise<
   }
 }
 
+/**
+ * Whether a clip ended because something cut it on purpose, not because playback broke:
+ * 137 is a killed player (another lane in interrupt mode, /speak stop elsewhere); this lane
+ * cutting its own clip kills the whole pipeline, which the engine reports as 1; and a
+ * /speak stop since the clip started cuts it too.
+ */
+async function wasCut($: $, tag: string, playedAt: number, exitCode: number): Promise<boolean> {
+  if (exitCode === 137 || st.cutTags.has(tag)) return true
+  const current = await $.fs.read(await dataPath($, CURRENT_FILE)).catch(() => '')
+  return current.startsWith('stopped ') && Number(current.slice(8)) >= playedAt
+}
+
 /** Plays while Fish generates. Resolves when the clip ends or something cuts it. */
 async function streamSpeech($: $, key: string, ffmpeg: string, text: string, clip: string, lane: Lane): Promise<void> {
   const tag = `${TAG_PREFIX}${await $.clock.now()}`
@@ -699,6 +717,7 @@ async function streamSpeech($: $, key: string, ffmpeg: string, text: string, cli
   await $.fs.write(bodyPath, ttsBody(text, lane.voiceId, lane.speed))
   await $.process.run(['/bin/mkdir', '-p', '-m', '700', await homeData($)])
   st.streamTag = tag
+  const playedAt = await $.clock.now()
   await glowOn($, clip, lane)
   try {
     const ran = await $.process.run(
@@ -711,12 +730,12 @@ async function streamSpeech($: $, key: string, ffmpeg: string, text: string, cli
     )
     const status = /returned error: (\d+)/.exec(ran.stderr)?.[1]
     if (status !== undefined) $.ui.toast(fishError('text-to-speech', Number(status), ''), { timeoutMs: 8000 })
-    else if (ran.exitCode !== 0 && ran.exitCode !== 137) {
-      // 137 is the clip being cut (/speak stop, or interrupt mode). Anything else is the player failing.
+    else if (ran.exitCode !== 0 && !(await wasCut($, tag, playedAt, ran.exitCode))) {
       $.ui.toast(`claudespeak: playback failed: ${ran.stderr.trim().split('\n').pop()?.slice(0, 80) ?? ''}`, { timeoutMs: 8000 })
     }
   } finally {
     if (st.streamTag === tag) st.streamTag = undefined
+    st.cutTags.delete(tag)
     await glowOff($, clip)
     await rm($, bodyPath)
   }
@@ -769,10 +788,12 @@ async function sayLine($: $, line: string, opts: SayOptions): Promise<void> {
 
 /** A finished reply: summarised, then said, unless this lane is muted or only speaks when needed. */
 async function speak($: $, answer: string): Promise<void> {
-  stopSpeech($)
+  const settings = await readSettings($)
+  // Interrupt mode: the newest reply wins, even over this lane's own. Queue mode: a lane's
+  // new update waits behind its earlier one, so a lane that keeps working keeps reporting.
+  if (settings.mode === 'interrupt') stopSpeech($)
   const gen = st.speechGen
   const startedAt = await $.clock.now()
-  const settings = await readSettings($)
   if (settings.when === 'needed' && !needsYou(answer)) return
   const lane = await laneInfo($)
   if (lane.isMuted) return
@@ -1035,9 +1056,11 @@ export const register: Register = (on, options) => {
     return { text: `Spoken replies are ${settings.isOn ? 'on' : 'off'} in every session. ${how}; ${names}.${when}${muted}${quiet}${noKey}` }
   }).catch(() => ({ text: 'claudespeak: /speak failed.' }))
 
-  // A new prompt means the person has moved on: cut the old reply's speech.
-  on('prompt.submit', ($, e, next) => {
-    stopSpeech($)
+  // Interrupt mode: a new prompt means the person has moved on, so cut this lane's speech.
+  // Queue mode: the lane keeps talking while it works (prompts it sends itself included);
+  // Stop, /speak stop and /speak mute still cut it.
+  on('prompt.submit', async ($, e, next) => {
+    if ((await readSettings($)).mode === 'interrupt') stopSpeech($)
     return next(e)
   }).catch(($, e, next) => next(e))
 
