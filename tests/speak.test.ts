@@ -22,6 +22,10 @@ type World = {
   started: Promise<string>
   /** Lets a streaming run end, as the clip's end or a kill does. */
   endStream: () => void
+  /** The fake clock, to move time on while a lane waits its turn. */
+  clock: ReturnType<typeof mock.clock>
+  /** Whether another lane's clip is playing, as pgrep would report it. */
+  setPlaying: (isPlaying: boolean) => void
 }
 
 const ran = (stdout: string, exitCode = 0, stderr = ''): ProcessRunResult => ({
@@ -35,9 +39,10 @@ const ran = (stdout: string, exitCode = 0, stderr = ''): ProcessRunResult => ({
 /** Everything beneath the plugin, answered from memory: no speaker, no network, no credits. */
 const world = (
   on: On,
-  opts: { envText?: string; hasFfmpeg?: boolean; stderr?: string; summary?: string; env?: Record<string, string>; setting?: string; current?: string } = {},
+  opts: { isPlaying?: boolean; envText?: string; hasFfmpeg?: boolean; stderr?: string; summary?: string; env?: Record<string, string>; setting?: string; current?: string } = {},
 ): World => {
-  mock.clock(on, { now: 1_000 })
+  const clock = mock.clock(on, { now: 1_000 })
+  const playing = { value: opts.isPlaying === true }
   mock.store(on)
   mock.env(on, { TMPDIR: '/tmp/speak-test/', HOME: '/home/me', ...opts.env })
   const files = new Map<string, string>()
@@ -59,6 +64,10 @@ const world = (
       started = resolve
     }),
     endStream: () => endStream(),
+    clock,
+    setPlaying: isPlaying => {
+      playing.value = isPlaying
+    },
   }
 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -102,6 +111,7 @@ const world = (
       return { value: ran('') }
     }
     if (bin === '/usr/bin/which') return { value: ran('', 1) }
+    if (bin === '/usr/bin/pgrep') return { value: ran('', playing.value ? 0 : 1) }
     return { value: ran('') }
   })
   on('model.complete', ($, e) => {
@@ -351,12 +361,12 @@ describe('spoken replies', () => {
   test('/speak off and on write the file, and /speak alone reports it', async ($, on) => {
     const w = world(on, { envText: `FISH_API_KEY=${KEY}` })
     await person($)
-    expect((await $.command.run(cmd('speak'))).text).toBe('Spoken replies are on in every session.')
+    expect((await $.command.run(cmd('speak'))).text).toBe('Spoken replies are on in every session. Lanes take turns; each lane says its name first.')
     const off = await $.command.run(cmd('speak', 'off'))
     expect(off.text).toBe('Spoken replies are off in every session.')
-    expect(w.writes).toContainEqual({ path: `${DATA}/setting.json`, text: '{"isOn":false}' })
+    expect(w.writes).toContainEqual({ path: `${DATA}/setting.json`, text: '{"isOn":false,"mode":"queue","announce":true}\n' })
     expect(w.runs).toContainEqual(['/usr/bin/pkill', '-KILL', '-f', ANY_SPEECH])
-    expect((await $.command.run(cmd('speak'))).text).toBe('Spoken replies are off in every session.')
+    expect((await $.command.run(cmd('speak'))).text).toBe('Spoken replies are off in every session. Lanes take turns; each lane says its name first.')
     await $.turn.complete(answerTurn('Done.'))
     expect(w.runs.some(run => run.includes('https://api.fish.audio/v1/tts'))).toBe(false)
 
@@ -371,7 +381,7 @@ describe('spoken replies', () => {
     await person($)
     await $.command.run(cmd('speak', 'stop'))
     expect(w.writes.some(write => write.path.endsWith('setting.json'))).toBe(false)
-    expect((await $.command.run(cmd('speak'))).text).toBe('Spoken replies are on in every session.')
+    expect((await $.command.run(cmd('speak'))).text).toBe('Spoken replies are on in every session. Lanes take turns; each lane says its name first.')
   })
 
   test('a reply being summarised when /speak stop ran stays quiet', async ($, on) => {
@@ -441,3 +451,68 @@ describe('spoken replies', () => {
   })
 })
 
+
+describe('taking turns', () => {
+  const hasStreamed = (w: World) => w.runs.some(run => run.includes('https://api.fish.audio/v1/tts'))
+
+  test('a lane waits while another lane is talking, then speaks', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}`, isPlaying: true })
+    await person($)
+    await $.turn.complete(answerTurn('Done.'))
+    await w.clock.advance(3_000)
+    expect(hasStreamed(w)).toBe(false)
+    w.setPlaying(false)
+    await w.clock.advance(500)
+    await w.started
+    w.endStream()
+  })
+
+  test('a lane that waited too long gives up instead of reading old news', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}`, isPlaying: true })
+    await person($)
+    await $.turn.complete(answerTurn('Done.'))
+    await w.clock.advance(95_000)
+    w.setPlaying(false)
+    await w.clock.advance(2_000)
+    expect(hasStreamed(w)).toBe(false)
+  })
+
+  test('/speak stop makes a waiting lane leave the line', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}`, isPlaying: true })
+    await person($)
+    await $.turn.complete(answerTurn('Done.'))
+    await w.clock.advance(1_000)
+    await $.command.run(cmd('speak', 'stop'))
+    w.setPlaying(false)
+    await w.clock.advance(2_000)
+    expect(hasStreamed(w)).toBe(false)
+  })
+
+  test('interrupt mode starts at once, even over another lane', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}`, isPlaying: true, setting: '{"mode":"interrupt"}' })
+    await person($)
+    await $.turn.complete(answerTurn('Done.'))
+    await w.started
+    w.endStream()
+  })
+
+  test('the lane says its folder name first', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}` })
+    on('session.cwd', () => ({ value: '/Users/me/code/billing-api' }))
+    await $.session.start({ cwd: '/Users/me/code/billing-api', surface: 'terminal', isInteractive: true })
+    await $.turn.complete(answerTurn('Done.'))
+    await w.started
+    expect(body(w).text).toBe('billing api. Done.')
+    w.endStream()
+  })
+
+  test('with announce off the lane name is left out', async ($, on) => {
+    const w = world(on, { envText: `FISH_API_KEY=${KEY}`, setting: '{"announce":false}' })
+    on('session.cwd', () => ({ value: '/Users/me/code/billing-api' }))
+    await $.session.start({ cwd: '/Users/me/code/billing-api', surface: 'terminal', isInteractive: true })
+    await $.turn.complete(answerTurn('Done.'))
+    await w.started
+    expect(body(w).text).toBe('Done.')
+    w.endStream()
+  })
+})

@@ -41,6 +41,7 @@ type $ = EngineInterface
 const FISH = 'https://api.fish.audio'
 const CURL = '/usr/bin/curl'
 const PKILL = '/usr/bin/pkill'
+const PGREP = '/usr/bin/pgrep'
 const FFMPEG_PATHS = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']
 const MAX_SPOKEN = 300
 
@@ -58,6 +59,18 @@ const SETTING_FILE = 'setting.json'
 const CURRENT_FILE = 'current-speech'
 /** Per-lane voices: { names, folders, sessions }. Read at every reply, so edits apply at once. */
 const VOICES_FILE = 'voices.json'
+/** One file per clip waiting or playing, named by when it joined. */
+const QUEUE_DIR = 'queue'
+/** How often a waiting lane checks the line. */
+const POLL_MS = 400
+/** The pause between one lane's clip and the next. */
+const GAP_MS = 350
+/** A lane waiting longer than this gives up: its news is stale. */
+const MAX_WAIT_MS = 90_000
+/** A ticket not refreshed for this long belongs to a lane that died. */
+const TICKET_STALE_MS = 5_000
+/** Dead tickets older than this are deleted. */
+const TICKET_FORGET_MS = 60_000
 const TAG_PREFIX = 'claudespeak-'
 /** Any session's player and download, and nothing else: their own argv starts with the binary. */
 export const ANY_SPEECH = `^(${CURL}|[^ ]*/ffmpeg) .*${TAG_PREFIX}[0-9]+`
@@ -191,9 +204,86 @@ export type VoiceMap = {
   folders: Record<string, string>
   /** Session id -> name or id. Set with /speak voice <name> inside the lane. */
   sessions: Record<string, string>
+  /** Session id -> the lane's spoken name. Set with /speak name <label>. */
+  sessionLabels: Record<string, string>
+  /** Project folder -> the spoken name of every lane in it. Set with /speak name folder <label>. */
+  folderLabels: Record<string, string>
 }
 
-const EMPTY_VOICES: VoiceMap = { names: {}, folders: {}, sessions: {} }
+const EMPTY_VOICES: VoiceMap = { names: {}, folders: {}, sessions: {}, sessionLabels: {}, folderLabels: {} }
+
+/** This session's entry, else the deepest folder entry that holds `cwd`. */
+export const pickFor = (
+  bySession: Record<string, string>,
+  byFolder: Record<string, string>,
+  sessionId: string,
+  cwd: string,
+): string | undefined => {
+  const pinned = bySession[sessionId]
+  if (pinned !== undefined) return pinned
+  const strip = (p: string) => p.replace(/\/+$/, '')
+  const here = strip(cwd)
+  const folder = Object.keys(byFolder)
+    .filter(f => here === strip(f) || here.startsWith(`${strip(f)}/`))
+    .sort((a, b) => b.length - a.length)[0]
+  return folder !== undefined ? byFolder[folder] : undefined
+}
+
+/**
+ * What the lane is called out loud: its label, else its folder's name made speakable
+ * ("billing-api" -> "billing api"). Nothing for the home folder or the app's scratch folders.
+ */
+export const laneLabel = (map: VoiceMap, sessionId: string, cwd: string, home: string): string => {
+  const set = pickFor(map.sessionLabels, map.folderLabels, sessionId, cwd)
+  if (set !== undefined) return set
+  const here = cwd.replace(/\/+$/, '')
+  if (here === '' || here === home.replace(/\/+$/, '')) return ''
+  const base = here.slice(here.lastIndexOf('/') + 1)
+  if (/^scratch-/.test(base) || /^\.?tmp/.test(base)) return ''
+  return base.replace(/[-_.]+/g, ' ').trim()
+}
+
+/** The words Fish reads: the lane's name first, as its own short sentence, when there is one. */
+export const withLaneName = (label: string, line: string): string =>
+  label === '' ? line : `${label}. ${line}`
+
+// ---------- the queue: one voice at a time, each lane waiting its turn ----------
+
+export type SpeakMode = 'queue' | 'interrupt'
+export type Settings = { isOn: boolean; mode: SpeakMode; announce: boolean }
+
+/** setting.json, forgiving: missing fields take the defaults (on, queue, say the lane's name). */
+export const parseSettings = (text: string | undefined): Settings => {
+  try {
+    const raw = JSON.parse(text ?? '{}') as { isOn?: unknown; mode?: unknown; announce?: unknown }
+    return { isOn: raw.isOn !== false, mode: raw.mode === 'interrupt' ? 'interrupt' : 'queue', announce: raw.announce !== false }
+  } catch {
+    return { isOn: true, mode: 'queue', announce: true }
+  }
+}
+
+/** A ticket's name: when it joined (13 digits, so names sort by time) and a tiebreak. */
+export const ticketName = (now: number, tiebreak: number): string =>
+  `${String(Math.floor(now)).padStart(13, '0')}-${String(Math.floor(tiebreak)).padStart(6, '0')}`
+
+export const ticketTime = (name: string): number => Number(name.slice(0, 13))
+
+export type TicketEntry = { name: string; mtimeMs: number }
+
+/**
+ * Live tickets in line order (oldest first). A waiting lane refreshes its ticket every poll,
+ * so one untouched for `staleMs` belongs to a lane that died or is mid-clip: skip it. A
+ * lane mid-clip still holds the line, through its player, which `isAnyPlaying` sees.
+ */
+export const liveTickets = (entries: readonly TicketEntry[], now: number, staleMs: number): string[] =>
+  entries
+    .filter(e => /^\d{13}-\d{6}$/.test(e.name) && now - e.mtimeMs < staleMs)
+    .map(e => e.name)
+    .sort()
+
+/** How many live tickets are ahead of `mine`; 0 means it's this lane's turn once nothing plays. */
+export const placeInLine = (entries: readonly TicketEntry[], mine: string, now: number, staleMs: number): number =>
+  liveTickets(entries, now, staleMs).filter(n => n < mine).length
 
 const stringRecord = (value: unknown): Record<string, string> => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
@@ -206,7 +296,13 @@ const stringRecord = (value: unknown): Record<string, string> => {
 export const parseVoices = (text: string | undefined): VoiceMap => {
   try {
     const raw = JSON.parse(text ?? '{}') as Record<string, unknown>
-    return { names: stringRecord(raw.names), folders: stringRecord(raw.folders), sessions: stringRecord(raw.sessions) }
+    return {
+      names: stringRecord(raw.names),
+      folders: stringRecord(raw.folders),
+      sessions: stringRecord(raw.sessions),
+      sessionLabels: stringRecord(raw.sessionLabels),
+      folderLabels: stringRecord(raw.folderLabels),
+    }
   } catch {
     return EMPTY_VOICES
   }
@@ -221,24 +317,12 @@ export const voiceIdOf = (map: VoiceMap, nameOrId: string): string => {
 
 /** The lane's voice: this session's pick, else the deepest matching folder, else the default. */
 export const resolveVoice = (map: VoiceMap, sessionId: string, cwd: string, fallback: string): string => {
-  const pinned = map.sessions[sessionId]
-  if (pinned !== undefined) return voiceIdOf(map, pinned)
-  const strip = (p: string) => p.replace(/\/+$/, '')
-  const here = strip(cwd)
-  const folder = Object.keys(map.folders)
-    .filter(f => here === strip(f) || here.startsWith(`${strip(f)}/`))
-    .sort((a, b) => b.length - a.length)[0]
-  return folder !== undefined ? voiceIdOf(map, map.folders[folder] ?? '') : fallback
+  const pick = pickFor(map.sessions, map.folders, sessionId, cwd)
+  return pick !== undefined ? voiceIdOf(map, pick) : fallback
 }
 
 /** A missing or unreadable setting means on. */
-export const parseSetting = (text: string | undefined): boolean => {
-  try {
-    return (JSON.parse(text ?? '{}') as { isOn?: unknown }).isOn !== false
-  } catch {
-    return true
-  }
-}
+export const parseSetting = (text: string | undefined): boolean => parseSettings(text).isOn
 
 const ENV_TEMPLATE = '# Get a key at https://fish.audio/app/api-keys/ and paste it after the = below.\nFISH_API_KEY=\n'
 
@@ -285,8 +369,7 @@ async function writeData($: $, file: string, text: string): Promise<void> {
 
 /** Read from the file at every reply, so a change reaches sessions already open. */
 async function isSettingOn($: $): Promise<boolean> {
-  const text = await $.fs.read(await dataPath($, SETTING_FILE)).catch(() => undefined)
-  return parseSetting(text)
+  return (await readSettings($)).isOn
 }
 
 /** Cuts speech in every session, and tells a reply still being summarised to stay quiet. */
@@ -294,6 +377,8 @@ async function stopEverySpeech($: $): Promise<void> {
   stopSpeech($)
   await $.process.run([PKILL, '-KILL', '-f', ANY_SPEECH]).catch(() => undefined)
   await writeData($, CURRENT_FILE, `stopped ${await $.clock.now()}`)
+  // Waiting lanes see the stop and leave; this just tidies the line at once.
+  await $.process.run(['/bin/sh', '-c', 'rm -f "$1"/*', 'claudespeak', await queueDir($)]).catch(() => undefined)
 }
 
 async function tmpDir($: $): Promise<string> {
@@ -382,47 +467,111 @@ async function readVoices($: $): Promise<VoiceMap> {
   return parseVoices(await $.fs.read(await dataPath($, VOICES_FILE)).catch(() => undefined))
 }
 
-/** This lane's Fish voice id. */
-async function laneVoice($: $): Promise<string> {
+/** Read at every reply, so /speak mode or announce in one lane reaches every lane. */
+async function readSettings($: $): Promise<Settings> {
+  return parseSettings(await $.fs.read(await dataPath($, SETTING_FILE)).catch(() => undefined))
+}
+
+/** Changes some settings, keeping the rest. */
+async function writeSettings($: $, change: Partial<Settings>): Promise<Settings> {
+  const next = { ...(await readSettings($)), ...change }
+  await writeData($, SETTING_FILE, `${JSON.stringify(next)}\n`)
+  return next
+}
+
+type Lane = { voiceId: string; voiceName: string; label: string }
+
+/** This lane's voice, the voice's friendly name, and what the lane is called out loud. */
+async function laneInfo($: $): Promise<Lane> {
   const map = await readVoices($)
   const sessionId = await $.session.id().catch(() => '')
   const cwd = await $.session.cwd().catch(() => '')
-  return resolveVoice(map, sessionId, cwd, cfg.voiceId)
+  const home = (await $.env.get('HOME')) ?? ''
+  const voiceId = resolveVoice(map, sessionId, cwd, cfg.voiceId)
+  const voiceName = Object.entries(map.names).find(([, v]) => v === voiceId)?.[0] ?? `voice ${voiceId.slice(0, 6)}`
+  return { voiceId, voiceName, label: laneLabel(map, sessionId, cwd, home) }
 }
 
-/** The voice's friendly name from voices.json, else a short form of its id. */
-async function voiceName($: $, id: string): Promise<string> {
-  const map = await readVoices($)
-  return Object.entries(map.names).find(([, v]) => v === id)?.[0] ?? `voice ${id.slice(0, 6)}`
+/** Shows this lane's bar: waiting its turn, or speaking. */
+async function showLane($: $, clip: string, lane: Lane, state: Speaking['state'], ahead = 0): Promise<void> {
+  await update($, speaking, () => ({ tag: clip, name: lane.voiceName, label: lane.label, color: laneColor(lane.voiceId), state, ahead }))
 }
 
-/** Lights this lane: a glowing frame behind the conversation and a label above the prompt. */
-async function glowOn($: $, tag: string, voiceId: string): Promise<void> {
-  await update($, speaking, () => ({ tag, name: '', color: laneColor(voiceId) }))
-  const name = await voiceName($, voiceId)
-  await update($, speaking, now => (now?.tag === tag ? { ...now, name } : now))
-  // Drawn only where the app draws plugin backdrops (not the desktop Code tab yet); the bar below always shows.
+/** Lights this lane while it talks: the bar, and a glow where the app draws plugin backdrops. */
+async function glowOn($: $, clip: string, lane: Lane): Promise<void> {
+  await showLane($, clip, lane, 'speaking')
+  // Drawn only where the app draws plugin backdrops (not the desktop Code tab yet); the bar always shows.
   await $.theme.set({ backdrop: { scene: GLOW_SCENE } }).catch(() => undefined)
-
 }
 
-/** Dims this lane, unless a newer clip here has already taken the glow. */
-async function glowOff($: $, tag: string): Promise<void> {
+/** Clears this lane's bar (and glow), unless a newer clip here has already taken it. */
+async function glowOff($: $, clip: string): Promise<void> {
   const now = await read($, speaking)
-  if (now === null || now.tag !== tag) return
+  if (now === null || now.tag !== clip) return
   await update($, speaking, () => null)
-  await $.theme.clear().catch(() => undefined)
+  if (now.state === 'speaking') await $.theme.clear().catch(() => undefined)
+}
+
+/** True while any lane's clip is downloading or playing. */
+async function isAnyPlaying($: $): Promise<boolean> {
+  const ran = await $.process.run([PGREP, '-f', ANY_SPEECH]).catch(() => undefined)
+  return ran?.exitCode === 0
+}
+
+async function queueDir($: $): Promise<string> {
+  return dataPath($, QUEUE_DIR)
+}
+
+/** Keeps a ticket alive: its file's time is the lane's heartbeat. */
+async function touchTicket($: $, ticket: string): Promise<void> {
+  await $.fs.write(`${await queueDir($)}/${ticket}`, `${await $.clock.now()}\n`)
+}
+
+async function dropTicket($: $, ticket: string): Promise<void> {
+  await rm($, `${await queueDir($)}/${ticket}`)
+}
+
+/**
+ * Joins the line and waits for this lane's turn: no live ticket ahead and nothing playing.
+ * False when the lane gave up: a newer reply here, /speak stop, or waiting past MAX_WAIT_MS.
+ * No lock: a ticket is a file whose time a waiting lane refreshes, so one left by a lane
+ * that died stops counting within TICKET_STALE_MS.
+ */
+async function waitTurn($: $, ticket: string, gen: number, lane: Lane): Promise<boolean> {
+  const dir = await queueDir($)
+  await $.process.run(['/bin/mkdir', '-p', '-m', '700', dir])
+  const joined = ticketTime(ticket)
+  let shownAhead = -1
+  for (;;) {
+    await touchTicket($, ticket)
+    const now = await $.clock.now()
+    if (gen !== st.speechGen) return false
+    const current = await $.fs.read(await dataPath($, CURRENT_FILE)).catch(() => '')
+    if (current.startsWith('stopped ') && Number(current.slice(8)) > joined) return false
+    if (now - joined > MAX_WAIT_MS) return false
+    const entries = await $.fs.list(dir).catch(() => [])
+    for (const e of entries) {
+      if (e.kind === 'file' && now - e.mtimeMs > TICKET_FORGET_MS) await rm($, `${dir}/${e.name}`)
+    }
+    const ahead = placeInLine(entries, ticket, now, TICKET_STALE_MS)
+    if (ahead === 0 && !(await isAnyPlaying($))) return true
+    const shown = Math.max(1, ahead)
+    if (shown !== shownAhead) {
+      shownAhead = shown
+      await showLane($, ticket, lane, 'waiting', shown)
+    }
+    await $.clock.sleep(POLL_MS)
+  }
 }
 
 /** Plays while Fish generates. Resolves when the clip ends or something cuts it. */
-async function streamSpeech($: $, key: string, ffmpeg: string, text: string): Promise<void> {
+async function streamSpeech($: $, key: string, ffmpeg: string, text: string, clip: string, lane: Lane): Promise<void> {
   const tag = `${TAG_PREFIX}${await $.clock.now()}`
   const bodyPath = `${await tmpDir($)}/${tag}.json`
-  const voiceId = await laneVoice($)
-  await $.fs.write(bodyPath, ttsBody(text, voiceId))
+  await $.fs.write(bodyPath, ttsBody(text, lane.voiceId))
   await $.process.run(['/bin/mkdir', '-p', '-m', '700', await homeData($)])
   st.streamTag = tag
-  await glowOn($, tag, voiceId)
+  await glowOn($, clip, lane)
   try {
     const ran = await $.process.run(
       [
@@ -435,12 +584,12 @@ async function streamSpeech($: $, key: string, ffmpeg: string, text: string): Pr
     const status = /returned error: (\d+)/.exec(ran.stderr)?.[1]
     if (status !== undefined) $.ui.toast(fishError('text-to-speech', Number(status), ''), { timeoutMs: 8000 })
     else if (ran.exitCode !== 0 && ran.exitCode !== 137) {
-      // 137 is another reply taking over. Anything else is the player failing.
+      // 137 is the clip being cut (/speak stop, or interrupt mode). Anything else is the player failing.
       $.ui.toast(`claudespeak: playback failed: ${ran.stderr.trim().split('\n').pop()?.slice(0, 80) ?? ''}`, { timeoutMs: 8000 })
     }
   } finally {
     if (st.streamTag === tag) st.streamTag = undefined
-    await glowOff($, tag)
+    await glowOff($, clip)
     await rm($, bodyPath)
   }
 }
@@ -460,7 +609,21 @@ async function speak($: $, answer: string): Promise<void> {
     $.ui.toast('ffmpeg not found: brew install ffmpeg', { timeoutMs: 8000 })
     return
   }
-  await streamSpeech($, key, ffmpeg, line)
+  const settings = await readSettings($)
+  const lane = await laneInfo($)
+  const text = settings.announce ? withLaneName(lane.label, line) : line
+  const clip = ticketName(await $.clock.now(), Math.random() * 1_000_000)
+  if (settings.mode === 'interrupt') return streamSpeech($, key, ffmpeg, text, clip, lane)
+  try {
+    if (!(await waitTurn($, clip, gen, lane))) return
+    await streamSpeech($, key, ffmpeg, text, clip, lane)
+    // Hold the place a moment so the next lane starts after a short pause, not on top.
+    await touchTicket($, clip)
+    await $.clock.sleep(GAP_MS)
+  } finally {
+    await glowOff($, clip)
+    await dropTicket($, clip)
+  }
 }
 
 /**
@@ -494,10 +657,21 @@ export const register: Register = (on, options) => {
     const now = await read($, speaking)
     if (now === null || e.props.hasSurvey) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
+    const who = [now.label, now.name].filter(part => part !== '').join(' · ').toUpperCase()
+    if (now.state === 'waiting') {
+      return (
+        <Box paddingX={1} justifyContent="space-between" width="100%">
+          <Text color={now.color} weight="semibold">
+            ⏳ WAITING TO SPEAK{who ? ` · ${who}` : ''} · {now.ahead} ahead
+          </Text>
+          <Button key="stop" label="Stop all" onPress={() => stopEverySpeech($)} />
+        </Box>
+      )
+    }
     return (
       <Box backgroundColor={now.color} paddingX={1} justifyContent="space-between" width="100%">
         <Text color="#111111" backgroundColor={now.color} weight="bold">
-          🔊 SPEAKING{now.name ? ` · ${now.name.toUpperCase()}` : ''}
+          🔊 SPEAKING{who ? ` · ${who}` : ''}
         </Text>
         <Button key="stop" label="Stop" onPress={() => stopEverySpeech($)} />
       </Box>
@@ -513,8 +687,8 @@ export const register: Register = (on, options) => {
     }
     await $.command.register({
       name: 'speak',
-      description: 'Read replies aloud: /speak on, off, stop, key, voices, voice [folder] <name|id|default>',
-      argumentHint: '[on|off|stop|key|voices|voice [folder] <name|id|default>]',
+      description: 'Read replies aloud: /speak on|off|stop|key|voices, voice|name [folder] <…|default>, mode queue|interrupt, announce on|off',
+      argumentHint: '[on|off|stop|key|voices|voice …|name …|mode queue|interrupt|announce on|off]',
       immediate: true,
     })
     return next(e)
@@ -568,15 +742,55 @@ export const register: Register = (on, options) => {
       }
     }
     if (arg === 'on' || arg === 'off') {
-      await writeData($, SETTING_FILE, JSON.stringify({ isOn: arg === 'on' }))
+      await writeSettings($, { isOn: arg === 'on' })
       if (arg === 'off') await stopEverySpeech($)
       $.ui.toast(arg === 'on' ? `Spoken replies on everywhere (${cfg.ttsModel})` : 'Spoken replies off everywhere')
       return { text: `Spoken replies are ${arg} in every session.` }
     }
-    const isOn = await isSettingOn($)
-    const quiet = isOn && !(await mayTalkHere($)) ? ' This session stays quiet: no person is attached to it.' : ''
+    if (arg === 'mode queue' || arg === 'mode interrupt') {
+      const mode = arg === 'mode queue' ? 'queue' : 'interrupt'
+      await writeSettings($, { mode })
+      return {
+        text:
+          mode === 'queue'
+            ? 'Lanes now take turns: each one finishes before the next starts.'
+            : 'The newest reply now cuts off whatever is playing.',
+      }
+    }
+    if (arg === 'announce on' || arg === 'announce off') {
+      await writeSettings($, { announce: arg === 'announce on' })
+      return { text: arg === 'announce on' ? 'Each lane now says its name first.' : 'Lanes no longer say their name first.' }
+    }
+    const nameArgs = /^name(?:\s+(folder))?(?:\s+(.+))?$/i.exec(e.args.trim())
+    if (nameArgs) {
+      const isFolder = nameArgs[1] !== undefined
+      const pick = nameArgs[2]?.trim()
+      const map = await readVoices($)
+      const sessionId = await $.session.id()
+      const cwd = await $.session.cwd()
+      if (pick === undefined) {
+        const label = laneLabel(map, sessionId, cwd, (await $.env.get('HOME')) ?? '')
+        return { text: label ? `This lane is called "${label}" out loud.` : 'This lane has no spoken name. Set one with /speak name <name>.' }
+      }
+      const target = isFolder ? map.folderLabels : map.sessionLabels
+      const slot = isFolder ? cwd : sessionId
+      if (pick.toLowerCase() === 'default') delete target[slot]
+      else target[slot] = pick
+      await writeData($, VOICES_FILE, `${JSON.stringify(map, null, 2)}\n`)
+      const where = isFolder ? `Every lane in ${cwd}` : 'This lane'
+      return {
+        text:
+          pick.toLowerCase() === 'default'
+            ? `${where} goes back to its folder's name.`
+            : `${where} is now called "${pick}" out loud.`,
+      }
+    }
+    const settings = await readSettings($)
+    const quiet = settings.isOn && !(await mayTalkHere($)) ? ' This session stays quiet: no person is attached to it.' : ''
     const noKey = (await apiKey($)) === undefined ? ' No Fish Audio key yet: run /speak key.' : ''
-    return { text: `Spoken replies are ${isOn ? 'on' : 'off'} in every session.${quiet}${noKey}` }
+    const how = settings.mode === 'queue' ? 'Lanes take turns' : 'The newest reply cuts in'
+    const names = settings.announce ? 'each lane says its name first' : 'lane names are off'
+    return { text: `Spoken replies are ${settings.isOn ? 'on' : 'off'} in every session. ${how}; ${names}.${quiet}${noKey}` }
   }).catch(() => ({ text: 'claudespeak: /speak failed.' }))
 
   // A new prompt means the person has moved on: cut the old reply's speech.
